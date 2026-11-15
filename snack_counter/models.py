@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -13,6 +14,7 @@ class RefillStatus(str, Enum):
 
     OPEN = "open"                        # box reported empty, waiting for someone to commit
     COMMITTED = "committed"              # exactly one volunteer has committed to buy
+    RECEIPT_PENDING = "receipt_pending"  # the buyer says they have bought; receipt not uploaded yet
     BLOCKED = "blocked"                  # no budget left this month, office admin asked to decide
     PURCHASED = "purchased"              # bought and restocked, claim not yet accepted by HR
     CLAIM_SUBMITTED = "claim_submitted"  # claim is with HR (1 to 10 days)
@@ -20,9 +22,11 @@ class RefillStatus(str, Enum):
     CLAIM_REJECTED = "claim_rejected"    # HR said no, a person must follow up
 
 
-# While a refill is in one of these states, the box is still empty and no
-# second refill can be opened for that office.
-BOX_STILL_EMPTY = {RefillStatus.OPEN, RefillStatus.COMMITTED, RefillStatus.BLOCKED}
+# While a refill is in one of these states it is still being dealt with, and
+# no second refill can be opened for that office. RECEIPT_PENDING is included
+# so that nobody else is asked to buy while the buyer still owes a receipt.
+BOX_STILL_EMPTY = {RefillStatus.OPEN, RefillStatus.COMMITTED, RefillStatus.RECEIPT_PENDING,
+                   RefillStatus.BLOCKED}
 
 
 @dataclass(frozen=True)
@@ -75,9 +79,13 @@ class Refill:
     offered_to: str | None = None
     offer_expires_at: datetime | None = None
 
-    # Who committed to buy, until when, and how much they may spend.
+    # Who committed to buy, their deadline for uploading the receipt, and how
+    # much they may spend.
     buyer: str | None = None
     commit_expires_at: datetime | None = None
+    remind_at: datetime | None = None       # when to remind the buyer about that deadline
+    reminded: bool = False
+    receipt_overdue_flagged: bool = False   # buyer and admin already told the receipt is late
     spend_cap: Decimal | None = None
     budget_month: tuple[int, int] | None = None   # (year, month) the money counts against
 
@@ -92,6 +100,10 @@ class Refill:
 
     purchase: Purchase | None = None
     over_cap: bool = False
+    # Sent to HR with the claim. If we have to send the same claim twice, HR
+    # can see it is the same one and not pay it twice. Unlike the refill id
+    # (R-1, R-2, ...) it is unique even after the service restarts.
+    claim_reference: str = field(default_factory=lambda: f"snack-refill-{uuid.uuid4().hex}")
     claim_id: str | None = None
     claim_sent_at: datetime | None = None
     claim_overdue_flagged: bool = False   # admin already told HR is taking too long

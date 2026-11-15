@@ -63,6 +63,7 @@ class HRClaim:
     currency: str
     description: str
     receipt_image: str
+    reference: str                   # the caller's own id for this claim
     status: str = "pending"          # pending, approved, rejected
     reason: str | None = None
 
@@ -78,22 +79,38 @@ class FakeHR:
     employee id. Approval happens later (1 to 10 days in real life); tests
     call approve() or reject() to simulate that. HR pays the employee in their
     payroll currency, so we always send the receipt currency and let HR convert.
+
+    Each claim comes with a reference chosen by the caller. A second claim
+    with a reference HR has already seen returns the first claim's id and
+    creates nothing. This is an assumption about the real HR system: the
+    brief does not say it supports this.
     """
 
     def __init__(self) -> None:
         self.claims: dict[str, HRClaim] = {}
+        self._claim_id_by_reference: dict[str, str] = {}
         self.available = True
+        # Set to True to make the next claim be saved by HR but the reply get
+        # lost on the way back, as happens when a network call times out.
+        self.lose_next_reply = False
         self._ids = count(1)
 
     def create_claim(self, *, employee_id: str, amount: Decimal, currency: str,
-                     description: str, receipt_image: str) -> str:
+                     description: str, receipt_image: str, reference: str) -> str:
         if not self.available:
             raise HRUnavailable("HR system did not respond")
-        if not (employee_id and receipt_image and description) or amount <= 0:
-            raise ValueError("HR needs employee id, a positive amount, a description and a receipt")
+        if not (employee_id and receipt_image and description and reference) or amount <= 0:
+            raise ValueError("HR needs employee id, a positive amount, a description, a receipt "
+                             "and a reference")
+        if reference in self._claim_id_by_reference:
+            return self._claim_id_by_reference[reference]      # already have it: no second claim
         claim_id = f"HR-{next(self._ids)}"
         self.claims[claim_id] = HRClaim(claim_id, employee_id, amount, currency,
-                                        description, receipt_image)
+                                        description, receipt_image, reference)
+        self._claim_id_by_reference[reference] = claim_id
+        if self.lose_next_reply:
+            self.lose_next_reply = False
+            raise HRUnavailable("HR saved the claim but the reply timed out")
         return claim_id
 
     def get_status(self, claim_id: str) -> str:

@@ -1,12 +1,16 @@
 """The refill lifecycle: from "box is empty" to "volunteer is reimbursed".
 
     report_empty ──> OPEN ──commit──> COMMITTED ──record_purchase──> PURCHASED
-                      │  ^                │ (1 working day, no receipt) │
-                      │  └────────────────┘ handed to the next person   │ claim sent to HR
-                      │                                                 v
+                      │  ^                │   │                     ^   │
+                      │  └────────────────┘   └─confirm_bought─> RECEIPT_PENDING
+                      │   (1 working day, no word:                      │ claim sent to HR
+                      │    handed to the next person)                   v
                       └─(no budget)─> BLOCKED              CLAIM_SUBMITTED
                         <─(new month)─┘                      │          │
                                                        REIMBURSED  CLAIM_REJECTED
+
+A buyer who says "bought" keeps the refill (RECEIPT_PENDING) and is never
+handed over; if their receipt is late, they and the office admin are told.
 
 Deadlines count office hours only (see working_hours.py), so nobody is timed
 out overnight or over a weekend.
@@ -47,6 +51,7 @@ class SnackService:
         *,
         offer_timeout: timedelta = timedelta(hours=2),                      # office hours
         commit_timeout: timedelta = timedelta(hours=HOURS_PER_DAY),         # one working day
+        reminder_lead: timedelta = timedelta(hours=2),                      # before the deadline
         escalate_after: timedelta = timedelta(hours=2 * HOURS_PER_DAY),     # two working days
         max_unpaid_claims: int = 2,
         fairness_window: timedelta = timedelta(days=30),
@@ -61,6 +66,7 @@ class SnackService:
         self.refills: dict[str, Refill] = {}
         self.offer_timeout = offer_timeout
         self.commit_timeout = commit_timeout
+        self.reminder_lead = reminder_lead
         self.escalate_after = escalate_after
         self.hr_max_wait = hr_max_wait
         self.max_unpaid_claims = max_unpaid_claims
@@ -147,14 +153,15 @@ class SnackService:
         unpaid: dict[str, int] = {}
         busy: set[str] = set()
         for r in self.refills.values():
-            if r.status == RefillStatus.COMMITTED and r.buyer:
+            if r.status in (RefillStatus.COMMITTED, RefillStatus.RECEIPT_PENDING) and r.buyer:
                 busy.add(r.buyer)
             if r.buyer and r.restocked_at:
                 if r.restocked_at >= since:
                     recent[r.buyer] = recent.get(r.buyer, 0) + 1
                 if r.buyer not in last or r.restocked_at > last[r.buyer]:
                     last[r.buyer] = r.restocked_at
-            if r.buyer and r.status in (RefillStatus.PURCHASED, RefillStatus.CLAIM_SUBMITTED):
+            if r.buyer and r.status in (RefillStatus.RECEIPT_PENDING, RefillStatus.PURCHASED,
+                                        RefillStatus.CLAIM_SUBMITTED):
                 unpaid[r.buyer] = unpaid.get(r.buyer, 0) + 1
         return recent, last, unpaid, busy
 
@@ -208,7 +215,7 @@ class SnackService:
             refill.buyer = employee_id
             refill.spend_cap = cap
             refill.budget_month = month
-            refill.commit_expires_at = self._deadline(refill.office, self.commit_timeout)
+            self._start_receipt_deadline(refill)
             refill.offered_to = None
             refill.offer_expires_at = None
             refill.log(self._now(), f"{employee_id} committed, cap {cap}")
@@ -218,6 +225,33 @@ class SnackService:
             self.chat.dm(employee_id, f"Thanks! Spend up to {cap} {cur} and upload the receipt "
                                       f"by {self._local(refill.office, refill.commit_expires_at)}.")
             return True
+
+    def _start_receipt_deadline(self, refill: Refill) -> None:
+        """Give the buyer one working day from now, with a reminder shortly before."""
+        refill.commit_expires_at = self._deadline(refill.office, self.commit_timeout)
+        refill.remind_at = self._deadline(refill.office, self.commit_timeout - self.reminder_lead)
+        refill.reminded = False
+
+    def confirm_bought(self, refill_id: str, employee_id: str) -> None:
+        """The buyer says they have bought the snacks but hasn't uploaded the receipt yet.
+
+        From here on the refill stays theirs: it is never handed to someone
+        else, so nobody buys a second time and their receipt is always accepted.
+        """
+        with self._lock:
+            refill = self._get(refill_id)
+            if refill.buyer != employee_id or refill.status not in (
+                    RefillStatus.COMMITTED, RefillStatus.RECEIPT_PENDING):
+                raise RefillError("only the committed buyer can say they have bought")
+            if refill.status == RefillStatus.RECEIPT_PENDING:
+                return                                    # already told us
+            refill.status = RefillStatus.RECEIPT_PENDING
+            self._start_receipt_deadline(refill)          # a fresh working day for the receipt
+            refill.log(self._now(), f"{employee_id} has bought; receipt pending")
+            due = self._local(refill.office, refill.commit_expires_at)
+            self.chat.post_channel(refill.office, f"{self._name(employee_id)} has bought snacks ({refill.id}).")
+            self.chat.dm(employee_id, f"Thanks for buying! {refill.id} stays with you. "
+                                      f"Please upload the receipt by {due} so HR can pay you back.")
 
     def pass_offer(self, refill_id: str, employee_id: str) -> None:
         """The asked volunteer says they can't; ask the next person straight away."""
@@ -247,7 +281,15 @@ class SnackService:
 
                 elif refill.status == RefillStatus.COMMITTED:
                     if now >= refill.commit_expires_at:
-                        self._hand_over(refill)
+                        self._hand_over(refill)           # no word from the buyer: not bought
+                    else:
+                        self._remind_if_due(refill)
+
+                elif refill.status == RefillStatus.RECEIPT_PENDING:
+                    if now >= refill.commit_expires_at:
+                        self._flag_overdue_receipt(refill)   # told, but never handed over
+                    else:
+                        self._remind_if_due(refill)
 
                 elif refill.offered_to:
                     if now >= refill.offer_expires_at:
@@ -274,12 +316,39 @@ class SnackService:
         refill.budget_month = None
         refill.commit_expires_at = None
         refill.log(self._now(), f"{old} did not complete in time; handing over")
-        self.chat.dm(old, f"{refill.id} has been handed to someone else. Please don't buy for it now.")
+        self.chat.dm(old, f"{refill.id} has been handed to someone else. Please don't buy for it now. "
+                          "If you have already bought, tell the office admin.")
         self._offer_next(refill)
+
+    def _remind_if_due(self, refill: Refill) -> None:
+        if refill.reminded or self._now() < refill.remind_at:
+            return
+        refill.reminded = True
+        due = self._local(refill.office, refill.commit_expires_at)
+        refill.log(self._now(), f"reminded {refill.buyer}")
+        if refill.status == RefillStatus.RECEIPT_PENDING:
+            self.chat.dm(refill.buyer, f"Reminder: please upload the receipt for {refill.id} by {due}.")
+        else:
+            self.chat.dm(refill.buyer, f"Reminder: the receipt for {refill.id} is due by {due}. If you have "
+                                       "already bought the snacks, reply 'bought' and the refill stays with "
+                                       "you. Otherwise it will be handed to someone else.")
+
+    def _flag_overdue_receipt(self, refill: Refill) -> None:
+        """The buyer has bought but the receipt is late: tell them and the admin, once."""
+        if refill.receipt_overdue_flagged:
+            return
+        refill.receipt_overdue_flagged = True
+        o = self.offices[refill.office]
+        refill.log(self._now(), "receipt overdue; buyer and admin told")
+        self.chat.dm(refill.buyer, f"The receipt for {refill.id} is overdue. Please upload it as soon as you "
+                                   "can: HR can't pay you back without it. The office admin has been told.")
+        self.chat.dm(o.admin_id, f"{refill.id}: {self._name(refill.buyer)} bought snacks for {o.name} but "
+                                 "hasn't uploaded the receipt. Please check with them so they get reimbursed.")
 
     def _escalate_if_stuck(self, refill: Refill) -> None:
         """The backstop: a box empty for two working days goes to a named person."""
-        if refill.escalated or refill.status == RefillStatus.BLOCKED:   # admin already knows
+        if refill.escalated or refill.status in (RefillStatus.BLOCKED,          # admin already knows
+                                                 RefillStatus.RECEIPT_PENDING):  # box has been restocked
             return
         if self._now() < refill.escalate_at:
             return
@@ -296,7 +365,8 @@ class SnackService:
                         left_over: list[str] | None = None) -> Refill:
         with self._lock:
             refill = self._get(refill_id)
-            if refill.status != RefillStatus.COMMITTED or refill.buyer != employee_id:
+            if refill.buyer != employee_id or refill.status not in (
+                    RefillStatus.COMMITTED, RefillStatus.RECEIPT_PENDING):
                 raise RefillError("only the committed buyer can record the purchase")
             office = self.offices[refill.office]
             if currency != office.currency:
@@ -331,6 +401,9 @@ class SnackService:
                 employee_id=refill.buyer, amount=p.amount, currency=p.currency,
                 description=f"Snack refill {refill.office} {p.purchased_at.date().isoformat()} ({refill.id})",
                 receipt_image=p.receipt_image,
+                # The same reference is sent on every attempt for this refill, so
+                # if HR already has the claim it returns that one and makes no new one.
+                reference=refill.claim_reference,
             )
         except HRUnavailable:
             refill.log(self._now(), "HR unavailable; claim will be retried")

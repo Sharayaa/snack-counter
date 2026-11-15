@@ -43,6 +43,9 @@ Deadlines:
 
 - An offer nobody answers within 2 office hours moves to the next volunteer.
 - A refill the buyer doesn't complete within one working day is handed to someone else, and its reserved money is freed.
+- The buyer is reminded once, 2 office hours before the deadline.
+- A buyer who replies "bought" keeps the refill past the deadline, and nobody else can commit to it.
+- If that buyer's receipt is late, the buyer and the admin are each told once, and the late receipt is still claimed.
 - Deadlines pause overnight and over weekends, in each office's own time zone.
 - If everyone passes, the asking starts again the next working day.
 - A box that is still empty after two working days is reported to the admin once.
@@ -59,5 +62,6 @@ Reimbursement:
 
 - The claim reaches HR with the right amount, currency, receipt and employee ID.
 - If HR is down, the claim is sent again later.
+- If HR saves the claim but the reply is lost, the retry finds the same claim and no duplicate is created.
 - The buyer is told when the claim is approved or rejected.
 - A claim still pending after 10 days is reported to the admin.
